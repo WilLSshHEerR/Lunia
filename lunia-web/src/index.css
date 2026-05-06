@@ -1,0 +1,16 @@
+@import "tailwindcss";
+
+body {
+  margin: 0;
+  overflow: hidden;
+  background-color: #000;
+}
+
+@keyframes glow {
+  0%, 100% { filter: drop-shadow(0 0 5px #fff) drop-shadow(0 0 10px #00D2FF); }
+  50% { filter: drop-shadow(0 0 10px #fff) drop-shadow(0 0 20px #00D2FF); }
+}
+
+.glow-effect {
+  animation: glow 2s ease-in-out infinite;
+}

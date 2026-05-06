@@ -1,0 +1,24 @@
+# Entornos Virtuales
+venv/
+.venv/
+env/
+
+# Dependencias de Node
+node_modules/
+lunia-web/node_modules/
+
+# Variables de Entorno (¡CRÍTICO!)
+.env
+
+# Archivos de Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDEs y otros
+.vscode/
+.idea/
+.DS_Store
+dist/
+lunia-web/dist/
+*.log
