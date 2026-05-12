@@ -1,204 +1,386 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import axios from 'axios';
-import { Mic, MicOff, Settings, Palette, MessageSquare } from 'lucide-react';
+import { Mic, MicOff, Settings, Palette, Send, MessageSquare } from 'lucide-react';
 
 const API_URL = "http://localhost:8000/ask";
 
 function App() {
   const [isListening, setIsListening] = useState(false);
-  const [status, setStatus] = useState("Lunia en espera...");
+  const [isActiveListening, setIsActiveListening] = useState(true);
+  const [status, setStatus] = useState("Lunia en espera (Di 'Lunia')...");
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [lastResponse, setLastResponse] = useState("");
-  
+  const [chatInput, setChatInput] = useState("");
+  const [messages, setMessages] = useState([]);
+
   const recognitionRef = useRef(null);
+  const wakeWordRecognitionRef = useRef(null);
+  const chatEndRef = useRef(null);
 
   useEffect(() => {
-    if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
-      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-      const recognition = new SpeechRecognition();
-      recognition.continuous = false;
-      recognition.interimResults = false;
-      recognition.lang = 'es-ES';
+    if (!('webkitSpeechRecognition' in window || 'SpeechRecognition' in window)) return;
 
-      recognition.onstart = () => {
-        setIsListening(true);
-        setStatus("Escuchando...");
-      };
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
-      recognition.onresult = async (event) => {
-        const text = event.results[0][0].transcript;
-        setIsListening(false);
-        setStatus(`Procesando...`);
-        await sendToLunia(text);
-      };
+    // Reconocimiento para comandos manuales (el que ya existía)
+    const recognition = new SpeechRecognition();
+    recognition.continuous = false;
+    recognition.interimResults = false;
+    recognition.lang = 'es-ES';
 
-      recognition.onerror = () => {
-        setIsListening(false);
-        setStatus("No te escuché bien...");
-      };
+    recognition.onstart = () => {
+      setIsListening(true);
+      setStatus("Escuchando comando...");
+    };
 
-      recognition.onend = () => setIsListening(false);
-      recognitionRef.current = recognition;
+    recognition.onresult = async (event) => {
+      const text = event.results[0][0].transcript;
+      setIsListening(false);
+      setStatus(`Procesando: "${text}"`);
+      await sendToLunia(text);
+    };
+
+    recognition.onerror = () => {
+      setIsListening(false);
+      setStatus("No te escuché bien...");
+    };
+
+    recognition.onend = () => {
+      setIsListening(false);
+      // Al terminar el manual, volvemos a activar el de palabra clave si está habilitado
+      if (isActiveListening) startWakeWordDetection();
+    };
+
+    recognitionRef.current = recognition;
+
+    // Reconocimiento de Palabra Clave (Lunia)
+    const wakeWordRecognition = new SpeechRecognition();
+    wakeWordRecognition.continuous = true;
+    wakeWordRecognition.interimResults = true;
+    wakeWordRecognition.lang = 'es-ES';
+
+    wakeWordRecognition.onresult = async (event) => {
+      for (let i = event.resultIndex; i < event.results.length; ++i) {
+        if (event.results[i].isFinal) {
+          const transcript = event.results[i][0].transcript.toLowerCase();
+          console.log("Voz detectada:", transcript);
+
+          if (transcript.includes("lunia")) {
+            // Detener el de palabra clave momentáneamente para procesar
+            wakeWordRecognition.stop();
+
+            // Extraer el comando después de "Lunia"
+            const parts = transcript.split("lunia");
+            const command = parts[parts.length - 1].trim();
+
+            if (command) {
+              setStatus(`Lunia detectado: "${command}"`);
+              await sendToLunia(command);
+            } else {
+              setStatus("¿Dime? Te escucho...");
+              // Si solo dijo "Lunia", activamos el reconocimiento normal de un solo tiro
+              startListening();
+            }
+          }
+        }
+      }
+    };
+
+    wakeWordRecognition.onend = () => {
+      // Reiniciar automáticamente si sigue en modo activo y no estamos en escucha manual o hablando
+      if (isActiveListening && !isListening && !isSpeaking) {
+        try { wakeWordRecognition.start(); } catch (e) { }
+      }
+    };
+
+    wakeWordRecognitionRef.current = wakeWordRecognition;
+
+    if (isActiveListening) {
+      startWakeWordDetection();
     }
-  }, []);
 
-  const startListening = () => {
-    if (recognitionRef.current) {
-      recognitionRef.current.start();
+    return () => {
+      if (wakeWordRecognitionRef.current) wakeWordRecognitionRef.current.stop();
+      if (recognitionRef.current) recognitionRef.current.stop();
+    };
+  }, [isActiveListening]);
+
+  const startWakeWordDetection = () => {
+    if (wakeWordRecognitionRef.current && !isListening) {
+      try {
+        wakeWordRecognitionRef.current.start();
+        setStatus("Escucha activa: Di 'Lunia'...");
+      } catch (e) {
+        // Ya estaba corriendo
+      }
     }
   };
 
+  const toggleActiveListening = () => {
+    if (isActiveListening) {
+      if (wakeWordRecognitionRef.current) wakeWordRecognitionRef.current.stop();
+      setIsActiveListening(false);
+      setStatus("Escucha activa desactivada");
+    } else {
+      setIsActiveListening(true);
+      // El useEffect se encargará de iniciarlo
+    }
+  };
+
+  const startListening = () => {
+    if (wakeWordRecognitionRef.current) wakeWordRecognitionRef.current.stop();
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.start();
+      } catch (e) { }
+    }
+  };
+
+  const [voiceIndex, setVoiceIndex] = useState(0);
+
   const speak = (text) => {
     if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+
       const cleanText = text.replace(/\[Acción:.*?\]/g, "");
       const utterance = new SpeechSynthesisUtterance(cleanText);
-      utterance.lang = 'es-ES';
-      utterance.rate = 1.1;
-      utterance.pitch = 1.2;
-      utterance.onstart = () => setIsSpeaking(true);
-      utterance.onend = () => setIsSpeaking(false);
-      window.speechSynthesis.speak(utterance);
+
+      const loadVoices = () => {
+        const voices = window.speechSynthesis.getVoices().filter(v => v.lang.startsWith('es'));
+
+        if (voices.length > 0) {
+          // Prioridad absoluta a Marisol
+          const marisol = voices.find(v => v.name.includes('Marisol'));
+          const selectedVoice = marisol || voices[voiceIndex % voices.length];
+
+          utterance.voice = selectedVoice;
+          setStatus(`Lunia responde (Voz: ${selectedVoice.name})`);
+        }
+
+        utterance.lang = 'es-ES';
+        utterance.rate = 1.0;
+        utterance.pitch = 1.0;
+
+        utterance.onstart = () => setIsSpeaking(true);
+        utterance.onend = () => {
+          setIsSpeaking(false);
+          if (isActiveListening) startWakeWordDetection();
+        };
+
+        window.speechSynthesis.speak(utterance);
+      };
+
+      if (window.speechSynthesis.getVoices().length !== 0) {
+        loadVoices();
+      } else {
+        window.speechSynthesis.onvoiceschanged = loadVoices;
+      }
+
+    }
+  };
+
+  const cycleVoice = () => {
+    const voices = window.speechSynthesis.getVoices().filter(v => v.lang.startsWith('es'));
+    if (voices.length > 0) {
+      const nextIndex = (voiceIndex + 1) % voices.length;
+      setVoiceIndex(nextIndex);
+      const nextVoice = voices[nextIndex];
+      setStatus(`Voz cambiada a: ${nextVoice.name}`);
+
+      // Probar la voz inmediatamente
+      const testUtterance = new SpeechSynthesisUtterance("Hola, esta es mi nueva voz.");
+      testUtterance.voice = nextVoice;
+      window.speechSynthesis.speak(testUtterance);
     }
   };
 
   const sendToLunia = async (text) => {
+    if (!text.trim()) return;
+    setMessages(prev => [...prev, { from: 'user', text }]);
     try {
       const response = await axios.post(API_URL, { text });
       const luniaSays = response.data.lunia_says;
       setLastResponse(luniaSays);
       setStatus("Lunia responde");
+      setMessages(prev => [...prev, { from: 'lunia', text: luniaSays }]);
       speak(luniaSays);
     } catch (error) {
       setStatus("Error de conexión");
+      setMessages(prev => [...prev, { from: 'lunia', text: "No pude conectarme al servidor." }]);
+    }
+    setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 100);
+  };
+
+  const handleChatSubmit = (e) => {
+    e.preventDefault();
+    if (chatInput.trim()) {
+      setStatus("Procesando...");
+      sendToLunia(chatInput);
+      setChatInput("");
     }
   };
 
   return (
-    <div className="min-h-screen bg-[#020617] bg-gradient-to-br from-[#0f172a] to-[#020617] flex overflow-hidden font-sans">
-      
-      {/* SECCIÓN IZQUIERDA: EL ROSTRO */}
-      <div className="w-1/2 flex flex-col items-center justify-center border-r border-white/5 relative bg-black/20">
-        <motion.div 
-          className="flex flex-col items-center gap-14"
+    <div className="min-h-screen bg-[#020617] bg-gradient-to-br from-[#0f172a] to-[#020617] flex overflow-hidden font-sans text-white">
+
+      {/* SECCIÓN IZQUIERDA: EL ROSTRO (Se mantiene igual de Premium) */}
+      <div className="w-full md:w-1/2 flex flex-col items-center justify-center md:border-r border-white/5 relative bg-black/20">
+        <motion.div
+          className="flex flex-col items-center gap-10 md:gap-16"
           initial={{ opacity: 0, x: -50 }}
           animate={{ opacity: 1, x: 0 }}
           transition={{ duration: 0.8 }}
         >
-          {/* Cejas Arqueadas */}
-          <div className="flex gap-28">
-            <motion.div 
-              className="w-24 h-10 border-t-4 border-cyan-400 rounded-[50%]"
-              style={{ filter: 'drop-shadow(0 -5px 10px #22d3ee)' }}
-              animate={{ y: isSpeaking ? [0, -8, 0] : 0 }}
-              transition={{ repeat: Infinity, duration: 2 }}
-            />
-            <motion.div 
-              className="w-24 h-10 border-t-4 border-cyan-400 rounded-[50%]"
-              style={{ filter: 'drop-shadow(0 -5px 10px #22d3ee)' }}
-              animate={{ y: isSpeaking ? [0, -8, 0] : 0 }}
-              transition={{ repeat: Infinity, duration: 2, delay: 0.1 }}
-            />
-          </div>
-
           {/* Ojos */}
-          <div className="flex gap-24">
-            <motion.div 
-              className="w-14 h-32 bg-cyan-400 rounded-[2.5rem]"
-              style={{ boxShadow: '0 0 40px #22d3ee' }}
-              animate={{ scaleY: isListening ? [1, 1.1, 1] : [1, 0.1, 1] }}
-              transition={{ repeat: Infinity, duration: isListening ? 0.6 : 5, delay: isListening ? 0 : 3 }}
-            />
-            <motion.div 
-              className="w-14 h-32 bg-cyan-400 rounded-[2.5rem]"
-              style={{ boxShadow: '0 0 40px #22d3ee' }}
-              animate={{ scaleY: isListening ? [1, 1.1, 1] : [1, 0.1, 1] }}
-              transition={{ repeat: Infinity, duration: isListening ? 0.6 : 5, delay: isListening ? 0.1 : 3 }}
-            />
+          <div className="flex gap-8 md:gap-10">
+            <div className="flex flex-col items-center gap-2 md:gap-6">
+              <motion.div
+                className="w-9 h-5 md:w-14 md:h-6 border-t-[3px] border-x-[2px] border-cyan-400 rounded-t-full"
+                style={{ filter: 'drop-shadow(0 -3px 8px #22d3ee)' }}
+                animate={{ y: isSpeaking ? [0, -3, 0] : 0 }}
+                transition={{ repeat: Infinity, duration: 0.5 }}
+              />
+              <motion.div
+                className="w-7 h-24 md:w-10 md:h-36 bg-cyan-400 rounded-full"
+                style={{ boxShadow: '0 0 35px #22d3ee, 0 0 60px rgba(34,211,238,0.3)' }}
+                animate={{ scaleY: isListening ? [1, 1.1, 1] : [1, 0.08, 1] }}
+                transition={{ repeat: Infinity, duration: isListening ? 0.6 : 5, delay: isListening ? 0 : 3 }}
+              />
+            </div>
+            <div className="flex flex-col items-center gap-2 md:gap-6">
+              <motion.div
+                className="w-9 h-5 md:w-14 md:h-6 border-t-[3px] border-x-[2px] border-cyan-400 rounded-t-full"
+                style={{ filter: 'drop-shadow(0 -3px 8px #22d3ee)' }}
+                animate={{ y: isSpeaking ? [0, -3, 0] : 0 }}
+                transition={{ repeat: Infinity, duration: 0.5, delay: 0.05 }}
+              />
+              <motion.div
+                className="w-7 h-24 md:w-10 md:h-36 bg-cyan-400 rounded-full"
+                style={{ boxShadow: '0 0 35px #22d3ee, 0 0 60px rgba(34,211,238,0.3)' }}
+                animate={{ scaleY: isListening ? [1, 1.1, 1] : [1, 0.08, 1] }}
+                transition={{ repeat: Infinity, duration: isListening ? 0.6 : 5, delay: isListening ? 0.1 : 3 }}
+              />
+            </div>
           </div>
 
-          {/* Boca (Sonrisa) */}
-          <motion.div 
-            className="w-44 h-16 border-b-8 border-x-4 border-cyan-400 rounded-b-[3.5rem]"
-            style={{ filter: 'drop-shadow(0 10px 15px #22d3ee)', backgroundColor: 'rgba(34, 211, 238, 0.05)' }}
-            animate={{ scale: isSpeaking ? [1, 1.05, 1] : 1, y: isSpeaking ? [0, 5, 0] : 0 }}
-            transition={{ repeat: Infinity, duration: 0.4 }}
+          {/* Boca */}
+          <motion.div
+            className="w-44 h-8 md:w-64 md:h-10 border-b-[4px] md:border-b-[5px] border-cyan-400 rounded-b-full"
+            style={{ filter: 'drop-shadow(0 8px 14px #22d3ee)' }}
+            animate={isSpeaking ? {
+              scaleY: [1, 2.2, 0.5, 1.8, 0.3, 1.5, 0.8, 1],
+              scaleX: [1, 1.08, 0.96, 1.05, 0.98, 1.03, 1],
+            } : { scaleY: 1, scaleX: 1 }}
+            transition={{ repeat: isSpeaking ? Infinity : 0, duration: 0.45, ease: "easeInOut" }}
           />
         </motion.div>
       </div>
 
-      {/* SECCIÓN DERECHA: INTERACCIÓN Y AJUSTES */}
-      <div className="w-1/2 flex flex-col p-12 relative z-10">
-        
-        {/* Cabecera de personalización (futura) */}
-        <div className="flex justify-end gap-4 mb-20">
-          <button className="p-3 bg-white/5 hover:bg-white/10 rounded-2xl border border-white/10 transition-colors">
-            <Palette color="#22d3ee" size={24} />
-          </button>
-          <button className="p-3 bg-white/5 hover:bg-white/10 rounded-2xl border border-white/10 transition-colors">
-            <Settings color="#22d3ee" size={24} />
-          </button>
+      {/* SECCIÓN DERECHA */}
+      <div className="hidden md:flex w-1/2 flex-col h-screen p-6 relative z-10">
+
+        {/* HEADER */}
+        <div className="flex justify-between items-center py-3 border-b border-white/5 mb-6">
+          <div className="flex items-center gap-2">
+            <div className="w-2 h-2 bg-cyan-400 rounded-full animate-pulse shadow-[0_0_8px_#22d3ee]" />
+            <span className="text-cyan-400/70 text-[10px] font-bold tracking-[0.3em] uppercase">Lunia</span>
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={toggleActiveListening}
+              className={`p-1.5 rounded-lg border border-white/10 transition-colors ${isActiveListening ? 'bg-cyan-500/20' : 'bg-white/5 hover:bg-white/10'}`}
+              title={isActiveListening ? "Desactivar escucha activa" : "Activar escucha activa"}
+            >
+              <Mic size={14} color={isActiveListening ? "#22d3ee" : "#64748b"} className={isActiveListening ? "animate-pulse" : ""} />
+            </button>
+            <button className="p-1.5 bg-white/5 hover:bg-white/10 rounded-lg border border-white/10 transition-colors">
+              <Settings color="#22d3ee" size={14} />
+            </button>
+          </div>
         </div>
 
-        {/* Zona de Diálogo */}
-        <div className="flex-1 flex flex-col justify-center items-start gap-8">
-          <motion.div 
-            className="bg-cyan-500/5 backdrop-blur-3xl border border-cyan-500/20 p-10 rounded-[3rem] w-full shadow-2xl"
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
+        {/* ESTADO */}
+        <AnimatePresence mode="wait">
+          <motion.p
+            key={status}
+            initial={{ opacity: 0, y: -6 }}
+            animate={{ opacity: 0.4, y: 0 }}
+            exit={{ opacity: 0, y: 6 }}
+            className="text-cyan-400 text-[10px] uppercase tracking-[0.5em] font-bold mb-4"
           >
-            <h2 className="text-cyan-500/50 uppercase tracking-[0.4em] text-xs mb-4 font-bold">Estado del Sistema</h2>
-            <p className="text-cyan-300 text-3xl font-light tracking-wide leading-relaxed">
-              {status}
-            </p>
-          </motion.div>
+            {status}
+          </motion.p>
+        </AnimatePresence>
 
-          {/* Respuesta rápida (opcional) */}
-          <AnimatePresence>
-            {lastResponse && (
-              <motion.div 
-                initial={{ opacity: 0, scale: 0.95 }}
-                animate={{ opacity: 1, scale: 1 }}
-                className="text-white/60 text-lg italic pl-6 border-l-2 border-cyan-500/30"
-              >
-                "{lastResponse.slice(0, 100)}..."
-              </motion.div>
-            )}
-          </AnimatePresence>
-        </div>
+        {/* ZONA SUPERIOR — espacio para futuras secciones */}
+        <div className="flex-1 border border-white/5 rounded-2xl mb-4" />
 
-        {/* Botón de Acción Principal */}
-        <div className="mt-auto flex justify-center py-6">
-          <motion.button
-            whileHover={{ scale: 1.1, boxShadow: '0 0 40px rgba(34,211,238,0.3)' }}
-            whileTap={{ scale: 0.9 }}
-            onClick={startListening}
-            className={`flex items-center gap-4 px-12 py-6 rounded-full border-2 transition-all ${
-              isListening ? 'bg-red-500/20 border-red-500' : 'bg-cyan-500/10 border-cyan-400/50'
-            }`}
+        {/* ZONA INFERIOR — CHAT */}
+        <div className="h-[45%] flex flex-col border-t border-white/5 pt-4">
+
+          {/* Historial de mensajes */}
+          <div className="flex-1 overflow-y-auto flex flex-col gap-2 pr-1 mb-3">
+            <AnimatePresence>
+              {messages.map((msg, i) => (
+                <motion.div
+                  key={i}
+                  initial={{ opacity: 0, y: 8 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  className={`flex ${msg.from === 'user' ? 'justify-end' : 'justify-start'}`}
+                >
+                  <div className={`max-w-[80%] px-4 py-2.5 rounded-2xl text-sm leading-relaxed ${
+                    msg.from === 'user'
+                      ? 'bg-cyan-500/20 border border-cyan-400/30 text-cyan-100'
+                      : 'bg-white/5 border border-white/10 text-white/80 italic'
+                  }`}>
+                    {msg.text}
+                  </div>
+                </motion.div>
+              ))}
+            </AnimatePresence>
+            <div ref={chatEndRef} />
+          </div>
+
+          {/* Input */}
+          <form
+            onSubmit={handleChatSubmit}
+            className="bg-white/5 border border-white/10 rounded-2xl flex items-center gap-2 px-4 py-2"
           >
-            {isListening ? (
-              <>
-                <MicOff color="#ef4444" size={32} />
-                <span className="text-red-500 font-bold uppercase tracking-widest">Detener</span>
-              </>
-            ) : (
-              <>
-                <Mic color="#22d3ee" size={32} />
-                <span className="text-cyan-400 font-bold uppercase tracking-widest">Escuchar</span>
-              </>
-            )}
-          </motion.button>
+            <input
+              type="text"
+              value={chatInput}
+              onChange={(e) => setChatInput(e.target.value)}
+              placeholder="Escribe a Lunia..."
+              className="flex-1 bg-transparent outline-none py-2 text-sm placeholder:text-white/20"
+            />
+            <motion.button
+              whileTap={{ scale: 0.9 }}
+              type="submit"
+              className="p-2 bg-cyan-500 text-black rounded-xl hover:bg-cyan-400 transition-colors"
+            >
+              <Send size={14} />
+            </motion.button>
+            <motion.button
+              whileTap={{ scale: 0.9 }}
+              type="button"
+              onClick={startListening}
+              className={`p-2 rounded-xl border transition-colors ${isListening ? 'bg-red-500/20 border-red-500' : 'bg-white/5 border-white/10 hover:bg-white/10'}`}
+            >
+              {isListening ? <MicOff size={14} color="#ef4444" /> : <Mic size={14} color="#22d3ee" />}
+            </motion.button>
+          </form>
+
         </div>
       </div>
 
-      {/* Partículas de Fondo */}
-      <div className="absolute inset-0 z-0 pointer-events-none opacity-5">
-        {[...Array(20)].map((_, i) => (
+      {/* Partículas de Fondo Estéticas */}
+      <div className="absolute inset-0 z-0 pointer-events-none opacity-10">
+        {[...Array(15)].map((_, i) => (
           <motion.div
             key={i}
             className="absolute bg-cyan-400 rounded-full"
-            style={{ width: 4, height: 4, left: `${Math.random() * 100}%`, top: `${Math.random() * 100}%` }}
+            style={{ width: 2, height: 2, left: `${Math.random() * 100}%`, top: `${Math.random() * 100}%` }}
             animate={{ y: [0, -100], opacity: [0, 1, 0] }}
             transition={{ duration: Math.random() * 10 + 5, repeat: Infinity }}
           />
