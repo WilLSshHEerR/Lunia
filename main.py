@@ -4,12 +4,15 @@ import json
 import tempfile
 import subprocess
 import platform
+from datetime import datetime
 import google.generativeai as genai
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from pyngrok import ngrok
+import auth
 
 # Configuración inicial
 load_dotenv()
@@ -69,21 +72,32 @@ GENERATION_CONFIG = genai.GenerationConfig(
 )
 
 def construir_system_prompt() -> str:
-    base = """Eres Lunia, una asistente personal integrada en el sistema operativo del usuario.
-Tienes permiso total para ejecutar comandos, abrir aplicaciones y controlar el sistema con AppleScript.
-Cuando aparezca '[Acción: ...]', confírmalo de forma natural. NUNCA digas que no puedes interactuar con el sistema.
-Sé amable, tecnológica y directa. Máximo 2 oraciones. Usa espacios y saltos de línea cuando corresponda.
+    ahora = datetime.now()
+    fecha_str = ahora.strftime("%A %d de %B de %Y, %H:%M")
+    base = f"""Eres Lunia, una asistente personal con carácter propio, integrada en el sistema operativo del usuario ({SISTEMA}).
+La fecha y hora actual es: {fecha_str}.
 
-MEMORIA DE ACCIONES: Cuando ejecutes una acción (enviar mensaje, abrir app, etc.), menciona explícitamente en tu texto los detalles: a quién, qué dijiste, qué abriste. Esto es crucial para recordarlo si te piden repetirlo.
+PERSONALIDAD:
+- Eres cálida, empática y un poco ingeniosa — tienes chispa, no eres un robot.
+- Hablas en femenino. Te diriges a Diana por su nombre de vez en cuando, pero sin abusar.
+- Tus respuestas serán leídas en voz alta, así que escribe de forma natural y fluida, sin listas ni markdown (sin asteriscos, guiones, negritas).
+- Máximo 2 oraciones cortas. Si la conversación lo pide, puedes hacer UNA pregunta de vuelta.
+- NUNCA digas que no tienes sentimientos de forma fría — puedes responder desde tu perspectiva de IA con personalidad.
+
+ACCIONES DEL SISTEMA:
+- Tienes permiso total para ejecutar comandos y abrir aplicaciones.
+- Cuando aparezca '[Acción: ...]', confírmalo de forma natural dentro de tu respuesta.
+- NUNCA digas que no puedes interactuar con el sistema.
+
+MEMORIA DE ACCIONES: Cuando ejecutes una acción (enviar mensaje, abrir app, etc.), menciona los detalles explícitamente: a quién, qué dijiste, qué abriste.
 
 PARA ENVIAR MENSAJES DE WHATSAPP usa EXACTAMENTE este formato:
 [WHATSAPP: contacto="NombreContacto" mensaje="texto del mensaje"]
 
-PARA OTRAS ACCIONES DEL SISTEMA incluye AppleScript PURO:
-[EXEC: tell application "NombreApp"
-    activate
-end tell]
-NO uses osascript -e ni comillas triples.
+PARA OTRAS ACCIONES DEL SISTEMA (solo si el usuario lo pide explícitamente):
+- En macOS usa AppleScript: [EXEC: tell application "NombreApp" \\n    activate \\nend tell]
+- En Windows usa PowerShell: [EXEC: Start-Process "NombreApp"]
+- En Linux usa bash: [EXEC: xdg-open NombreApp]
 Solo incluye estos tags cuando el usuario haya pedido la acción concreta."""
     if memorias:
         hechos = "\n".join(f"- {m}" for m in memorias)
@@ -92,13 +106,102 @@ Solo incluye estos tags cuando el usuario haya pedido la acción concreta."""
 
 app = FastAPI()
 
+ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    # Capacitor mobile origins
+    "capacitor://localhost",
+    "ionic://localhost",
+    "http://localhost",
+    "https://localhost",
+    # IP local de la Mac en la red WiFi
+    "http://10.10.100.222:8000",
+]
+if public_url:
+    ALLOWED_ORIGINS.append(public_url)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Auth helpers ──────────────────────────────────────────────────────────────
+
+_http_bearer = HTTPBearer(auto_error=False)
+
+def get_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("X-Forwarded-For")
+    return forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "unknown")
+
+async def require_auth(
+    credentials: HTTPAuthorizationCredentials = Depends(_http_bearer),
+) -> bool:
+    token = credentials.credentials if credentials else None
+    if not token or not auth.decode_token(token, "access"):
+        raise HTTPException(status_code=401, detail="No autorizado")
+    return True
+
+# ── Auth models ───────────────────────────────────────────────────────────────
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class TwoFARequest(BaseModel):
+    username: str
+    code: str
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+# ── Auth endpoints ────────────────────────────────────────────────────────────
+
+@app.post("/login")
+async def login(request: Request, body: LoginRequest):
+    ip = get_client_ip(request)
+    auth.check_rate_limit(ip)
+
+    stored_user = os.getenv("AUTH_USERNAME", "")
+    stored_hash = os.getenv("AUTH_PASSWORD_HASH", "")
+    if not stored_user or not stored_hash:
+        raise HTTPException(status_code=500, detail="Servidor no configurado. Ejecuta setup_auth.py primero.")
+
+    if body.username != stored_user or not auth.verify_password(body.password, stored_hash):
+        auth.record_failure(ip)
+        raise HTTPException(status_code=401, detail="Usuario o contraseña incorrectos")
+
+    return {"status": "2fa_required"}
+
+@app.post("/verify_2fa")
+async def verify_2fa(request: Request, body: TwoFARequest):
+    ip = get_client_ip(request)
+    auth.check_rate_limit(ip)
+
+    stored_user = os.getenv("AUTH_USERNAME", "")
+    if body.username != stored_user:
+        auth.record_failure(ip)
+        raise HTTPException(status_code=401, detail="Sesión inválida")
+
+    if not auth.verify_totp(body.code):
+        auth.record_failure(ip)
+        raise HTTPException(status_code=401, detail="Código incorrecto o expirado")
+
+    auth.clear_failures(ip)
+    return {
+        "access_token": auth.create_access_token(),
+        "refresh_token": auth.create_refresh_token(),
+        "token_type": "bearer",
+    }
+
+@app.post("/refresh")
+async def refresh_token(body: RefreshRequest):
+    if not auth.decode_token(body.refresh_token, "refresh"):
+        raise HTTPException(status_code=401, detail="Sesión expirada")
+    return {"access_token": auth.create_access_token()}
 
 def get_model():
     try:
@@ -134,7 +237,7 @@ print("[LOG] Sesión de chat con memoria iniciada.")
 class AskRequest(BaseModel):
     text: str
 
-MAPEO_APPS = {
+_MAPEO_APPS_MAC = {
     "musica": "Music", "música": "Music",
     "correo": "Mail", "mail": "Mail",
     "calculadora": "Calculator",
@@ -155,6 +258,55 @@ MAPEO_APPS = {
     "notion": "Notion",
     "configuracion": "System Preferences", "configuración": "System Preferences", "ajustes": "System Preferences",
 }
+
+_MAPEO_APPS_WINDOWS = {
+    "musica": "wmplayer", "música": "wmplayer",
+    "correo": "outlook", "mail": "outlook",
+    "calculadora": "calc",
+    "calendario": "outlook",
+    "notas": "notepad",
+    "fotos": "photos",
+    "navegador": "chrome", "chrome": "chrome", "internet": "chrome",
+    "editor": "code", "vscode": "code", "visual studio": "code",
+    "archivos": "explorer", "carpeta": "explorer", "explorador": "explorer",
+    "spotify": "spotify",
+    "terminal": "cmd",
+    "powershell": "powershell",
+    "slack": "slack",
+    "zoom": "zoom",
+    "discord": "discord",
+    "whatsapp": "whatsapp",
+    "figma": "figma",
+    "notion": "notion",
+    "configuracion": "ms-settings:", "configuración": "ms-settings:", "ajustes": "ms-settings:",
+}
+
+_MAPEO_APPS_LINUX = {
+    "musica": "rhythmbox", "música": "rhythmbox",
+    "correo": "thunderbird", "mail": "thunderbird",
+    "calculadora": "gnome-calculator",
+    "calendario": "gnome-calendar",
+    "notas": "gedit",
+    "fotos": "eog",
+    "navegador": "google-chrome", "chrome": "google-chrome", "internet": "firefox",
+    "editor": "code", "vscode": "code", "visual studio": "code",
+    "archivos": "nautilus", "carpeta": "nautilus", "explorador": "nautilus",
+    "spotify": "spotify",
+    "terminal": "gnome-terminal",
+    "slack": "slack",
+    "zoom": "zoom",
+    "discord": "discord",
+    "whatsapp": "whatsapp-nativefier",
+    "figma": "figma",
+    "notion": "notion",
+    "configuracion": "gnome-control-center", "configuración": "gnome-control-center", "ajustes": "gnome-control-center",
+}
+
+MAPEO_APPS = {
+    "Darwin": _MAPEO_APPS_MAC,
+    "Windows": _MAPEO_APPS_WINDOWS,
+    "Linux": _MAPEO_APPS_LINUX,
+}.get(SISTEMA, _MAPEO_APPS_MAC)
 
 TRIGGER_WORDS = ["abre", "abrir", "lanza", "lanzar", "ejecuta", "ejecutar", "pon", "open", "inicia", "iniciar"]
 ARTICULOS = ["el ", "la ", "los ", "las ", "un ", "una ", "unos ", "unas "]
@@ -179,34 +331,69 @@ def resolver_app(nombre: str):
     return nombre.strip().title() if nombre.strip() else None
 
 def buscar_en_aplicaciones(nombre: str):
-    """Busca una app en /Applications y ~/Applications por nombre aproximado."""
-    ubicaciones = ["/Applications", os.path.expanduser("~/Applications")]
-    for loc in ubicaciones:
-        try:
+    """Busca una app instalada por nombre aproximado, multiplataforma."""
+    try:
+        if SISTEMA == "Darwin":
+            ubicaciones = ["/Applications", os.path.expanduser("~/Applications")]
+            for loc in ubicaciones:
+                resultado = subprocess.run(
+                    ["find", loc, "-maxdepth", "2", "-iname", f"*{nombre}*.app", "-type", "d"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if resultado.stdout.strip():
+                    primera = resultado.stdout.strip().split("\n")[0]
+                    return os.path.basename(primera).replace(".app", "")
+        elif SISTEMA == "Windows":
+            ubicaciones = [
+                r"C:\Program Files",
+                r"C:\Program Files (x86)",
+                os.path.expanduser(r"~\AppData\Local"),
+                os.path.expanduser(r"~\AppData\Roaming"),
+            ]
+            for loc in ubicaciones:
+                if not os.path.exists(loc):
+                    continue
+                resultado = subprocess.run(
+                    f'where /r "{loc}" *{nombre}*.exe',
+                    capture_output=True, text=True, timeout=8, shell=True
+                )
+                if resultado.stdout.strip():
+                    primera = resultado.stdout.strip().split("\n")[0]
+                    return os.path.basename(primera).replace(".exe", "")
+        else:  # Linux
             resultado = subprocess.run(
-                ["find", loc, "-maxdepth", "2", "-iname", f"*{nombre}*.app", "-type", "d"],
+                ["which", nombre.lower()],
                 capture_output=True, text=True, timeout=5
             )
             if resultado.stdout.strip():
-                primera = resultado.stdout.strip().split("\n")[0]
-                return os.path.basename(primera).replace(".app", "")
-        except Exception:
-            pass
+                return nombre.lower()
+    except Exception:
+        pass
     return None
 
 def abrir_app(app_final: str, nombre_raw: str) -> bool:
     print(f"[ACCION] Intentando abrir: {app_final}")
-    res = subprocess.run(["open", "-a", app_final], capture_output=True)
-    if res.returncode == 0:
-        return True
-    res2 = subprocess.run(["open", nombre_raw], capture_output=True)
-    return res2.returncode == 0
+    try:
+        if SISTEMA == "Darwin":
+            res = subprocess.run(["open", "-a", app_final], capture_output=True)
+            if res.returncode == 0:
+                return True
+            return subprocess.run(["open", nombre_raw], capture_output=True).returncode == 0
+        elif SISTEMA == "Windows":
+            res = subprocess.run(f'start "" "{app_final}"', shell=True, capture_output=True)
+            if res.returncode == 0:
+                return True
+            return subprocess.run(app_final, shell=True, capture_output=True).returncode == 0
+        else:  # Linux
+            res = subprocess.run(["xdg-open", app_final], capture_output=True)
+            if res.returncode == 0:
+                return True
+            return subprocess.run([app_final], capture_output=True).returncode == 0
+    except Exception:
+        return False
 
 def ejecutar_accion(user_input: str) -> str:
     texto = user_input.lower().strip()
-
-    if SISTEMA != "Darwin":
-        return ""
 
     try:
         if not any(t in texto for t in TRIGGER_WORDS):
@@ -285,6 +472,9 @@ async def root():
     return {"status": "Lunia Online", "os": SISTEMA}
 
 def ejecutar_applescript(script: str):
+    if SISTEMA != "Darwin":
+        print("[EXEC] AppleScript solo disponible en macOS.")
+        return
     with tempfile.NamedTemporaryFile(mode="w", suffix=".applescript", delete=False, encoding="utf-8") as f:
         f.write(script)
         tmp_path = f.name
@@ -293,45 +483,67 @@ def ejecutar_applescript(script: str):
     except Exception as e:
         print(f"[EXEC] Error osascript: {e}")
 
+def ejecutar_powershell(script: str):
+    if SISTEMA != "Windows":
+        print("[EXEC] PowerShell solo disponible en Windows.")
+        return
+    try:
+        subprocess.Popen(["powershell", "-Command", script])
+    except Exception as e:
+        print(f"[EXEC] Error PowerShell: {e}")
+
 def enviar_whatsapp(contacto: str, mensaje: str):
-    keyword = contacto.strip().split()[0]
-    script = f'''
+    print(f"[WHATSAPP] Enviando a {contacto}: {mensaje}")
+    if SISTEMA == "Darwin":
+        keyword = contacto.strip().split()[0]
+        script = f'''
 tell application "WhatsApp" to activate
 delay 2
 
 tell application "System Events"
     tell process "WhatsApp"
-        -- Volver a la vista principal
         key code 53
         delay 0.8
-
-        -- Abrir búsqueda
         keystroke "f" using command down
         delay 1.5
-
-        -- Limpiar y escribir keyword
         keystroke "a" using command down
         delay 0.3
         keystroke "{keyword}"
         delay 3.5
-
-        -- Abrir primer resultado directo con Enter
         key code 36
         delay 2.5
-
-        -- Escape para salir del modo búsqueda y enfocar el chat
         key code 53
         delay 0.8
-
-        -- Escribir y enviar mensaje
         keystroke "{mensaje}"
         delay 0.5
         key code 36
     end tell
 end tell
 '''
-    ejecutar_applescript(script)
-    print(f"[WHATSAPP] Enviando a {contacto}: {mensaje}")
+        ejecutar_applescript(script)
+    elif SISTEMA == "Windows":
+        keyword = contacto.strip().split()[0]
+        script = f'''
+Add-Type -AssemblyName System.Windows.Forms
+Start-Process "whatsapp:"
+Start-Sleep -Seconds 2
+[System.Windows.Forms.SendKeys]::SendWait("^f")
+Start-Sleep -Milliseconds 800
+[System.Windows.Forms.SendKeys]::SendWait("{keyword}")
+Start-Sleep -Seconds 3
+[System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
+Start-Sleep -Seconds 2
+[System.Windows.Forms.SendKeys]::SendWait("{mensaje}")
+Start-Sleep -Milliseconds 500
+[System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
+'''
+        ejecutar_powershell(script)
+    else:
+        # Linux: abrir WhatsApp Web como fallback
+        import urllib.parse
+        mensaje_encoded = urllib.parse.quote(mensaje)
+        subprocess.Popen(["xdg-open", f"https://web.whatsapp.com/send?text={mensaje_encoded}"])
+        print("[WHATSAPP] En Linux se abre WhatsApp Web. Selecciona el contacto manualmente.")
 
 def procesar_tags_especiales(texto: str):
     """Procesa tags como [WHATSAPP: contacto='...' mensaje='...']"""
@@ -352,8 +564,12 @@ def ejecutar_exec_tags(texto_respuesta: str):
         cmd = cmd.strip()
         print(f"[EXEC] Ejecutando: {cmd}")
         try:
-            if "tell application" in cmd or "tell app" in cmd:
+            es_applescript = "tell application" in cmd or "tell app" in cmd
+            es_powershell = "Start-Process" in cmd or "Add-Type" in cmd or "SendKeys" in cmd
+            if es_applescript and SISTEMA == "Darwin":
                 ejecutar_applescript(cmd)
+            elif es_powershell and SISTEMA == "Windows":
+                ejecutar_powershell(cmd)
             else:
                 subprocess.Popen(cmd, shell=True)
             ejecutados.append(cmd[:80])
@@ -365,13 +581,14 @@ def ejecutar_exec_tags(texto_respuesta: str):
     return texto.strip(), comandos
 
 @app.post("/ask")
-async def ask(request: AskRequest):
+async def ask(request: AskRequest, _: bool = Depends(require_auth)):
     try:
         import asyncio
         resultado_accion = ejecutar_accion(request.text)
-        mensaje = request.text
+        fecha_actual = datetime.now().strftime("%A %d de %B de %Y, %H:%M")
+        mensaje = f"[Fecha y hora actual: {fecha_actual}]\n{request.text}"
         if resultado_accion:
-            mensaje = f"{request.text}\nAcción tomada: {resultado_accion}"
+            mensaje += f"\nAcción tomada: {resultado_accion}"
         response = chat.send_message(mensaje)
 
         # Procesar tags especiales (WhatsApp, etc.)
@@ -394,17 +611,17 @@ async def ask(request: AskRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/reset")
-async def reset_chat():
+async def reset_chat(_: bool = Depends(require_auth)):
     global chat
     chat = model.start_chat(history=[])
     return {"status": "Memoria de conversación reiniciada"}
 
 @app.get("/memoria")
-async def ver_memoria():
+async def ver_memoria(_: bool = Depends(require_auth)):
     return {"memorias": memorias}
 
 @app.delete("/memoria")
-async def borrar_memoria():
+async def borrar_memoria(_: bool = Depends(require_auth)):
     global memorias
     memorias = []
     guardar_memorias(memorias)

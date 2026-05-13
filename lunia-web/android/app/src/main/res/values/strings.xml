@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Lunia</string>
+    <string name="title_activity_main">Lunia</string>
+    <string name="package_name">com.lunia.app</string>
+    <string name="custom_url_scheme">com.lunia.app</string>
+</resources>

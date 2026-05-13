@@ -9,6 +9,8 @@ lunia-web/node_modules/
 
 # Variables de Entorno (¡CRÍTICO!)
 .env
+lunia-web/.env.production
+lunia_2fa_qr.png
 
 # Archivos de Python
 __pycache__/

@@ -1,0 +1,17 @@
+{
+  "appId": "com.lunia.app",
+  "appName": "Lunia",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "http",
+    "cleartext": true
+  },
+  "ios": {
+    "contentInset": "automatic",
+    "backgroundColor": "#020617"
+  },
+  "android": {
+    "backgroundColor": "#020617",
+    "allowMixedContent": true
+  }
+}

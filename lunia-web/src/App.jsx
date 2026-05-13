@@ -1,22 +1,92 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import axios from 'axios';
-import { Mic, MicOff, Settings, Palette, Send, MessageSquare } from 'lucide-react';
+import { Mic, MicOff, Settings, Send, LogOut } from 'lucide-react';
+import LoginPage from './LoginPage';
+import { apiUrl } from './api';
 
-const API_URL = "http://localhost:8000/ask";
+const API_URL = apiUrl('/ask');
 
 function App() {
+  const [accessToken, setAccessToken] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
   const [isListening, setIsListening] = useState(false);
   const [isActiveListening, setIsActiveListening] = useState(true);
   const [status, setStatus] = useState("Lunia en espera (Di 'Lunia')...");
   const [isSpeaking, setIsSpeaking] = useState(false);
-  const [lastResponse, setLastResponse] = useState("");
   const [chatInput, setChatInput] = useState("");
   const [messages, setMessages] = useState([]);
+  const [voiceIndex, setVoiceIndex] = useState(0);
 
   const recognitionRef = useRef(null);
   const wakeWordRecognitionRef = useRef(null);
   const chatEndRef = useRef(null);
+  const refreshTimerRef = useRef(null);
+
+  // ── Auth ────────────────────────────────────────────────────────────────────
+
+  const logout = useCallback(() => {
+    setAccessToken(null);
+    sessionStorage.removeItem('lunia_refresh');
+    if (refreshTimerRef.current) clearInterval(refreshTimerRef.current);
+  }, []);
+
+  const scheduleRefresh = useCallback((token) => {
+    if (refreshTimerRef.current) clearInterval(refreshTimerRef.current);
+    // Refresh 5 min before 30-min expiry
+    refreshTimerRef.current = setInterval(async () => {
+      const refresh = sessionStorage.getItem('lunia_refresh');
+      if (!refresh) { logout(); return; }
+      try {
+        const res = await axios.post(apiUrl('/refresh'), { refresh_token: refresh });
+        setAccessToken(res.data.access_token);
+      } catch {
+        logout();
+      }
+    }, 25 * 60 * 1000);
+  }, [logout]);
+
+  const handleLogin = useCallback((token) => {
+    setAccessToken(token);
+    scheduleRefresh(token);
+  }, [scheduleRefresh]);
+
+  // Try to restore session from sessionStorage on mount
+  useEffect(() => {
+    const tryRestore = async () => {
+      const refresh = sessionStorage.getItem('lunia_refresh');
+      if (refresh) {
+        try {
+          const res = await axios.post(apiUrl('/refresh'), { refresh_token: refresh });
+          handleLogin(res.data.access_token);
+        } catch {
+          sessionStorage.removeItem('lunia_refresh');
+        }
+      }
+      setAuthLoading(false);
+    };
+    tryRestore();
+    return () => { if (refreshTimerRef.current) clearInterval(refreshTimerRef.current); };
+  }, [handleLogin]);
+
+  // Axios interceptor: attach token and handle 401
+  useEffect(() => {
+    const reqId = axios.interceptors.request.use((config) => {
+      if (accessToken) config.headers['Authorization'] = `Bearer ${accessToken}`;
+      return config;
+    });
+    const resId = axios.interceptors.response.use(
+      (res) => res,
+      (err) => {
+        if (err.response?.status === 401 && accessToken) logout();
+        return Promise.reject(err);
+      }
+    );
+    return () => {
+      axios.interceptors.request.eject(reqId);
+      axios.interceptors.response.eject(resId);
+    };
+  }, [accessToken, logout]);
 
   useEffect(() => {
     if (!('webkitSpeechRecognition' in window || 'SpeechRecognition' in window)) return;
@@ -137,8 +207,6 @@ function App() {
     }
   };
 
-  const [voiceIndex, setVoiceIndex] = useState(0);
-
   const speak = (text) => {
     if ('speechSynthesis' in window) {
       window.speechSynthesis.cancel();
@@ -150,9 +218,13 @@ function App() {
         const voices = window.speechSynthesis.getVoices().filter(v => v.lang.startsWith('es'));
 
         if (voices.length > 0) {
-          // Prioridad absoluta a Marisol
-          const marisol = voices.find(v => v.name.includes('Marisol'));
-          const selectedVoice = marisol || voices[voiceIndex % voices.length];
+          // Voces preferidas por plataforma (macOS, Windows, Linux/Android)
+          const preferidas = ['Marisol', 'Paulina', 'Monica', 'Pilar', 'Lucia', 'Jorge', 'Juan', 'Diego'];
+          let selectedVoice = voices[voiceIndex % voices.length];
+          for (const nombre of preferidas) {
+            const encontrada = voices.find(v => v.name.includes(nombre));
+            if (encontrada) { selectedVoice = encontrada; break; }
+          }
 
           utterance.voice = selectedVoice;
           setStatus(`Lunia responde (Voz: ${selectedVoice.name})`);
@@ -220,6 +292,18 @@ function App() {
       setChatInput("");
     }
   };
+
+  if (authLoading) {
+    return (
+      <div className="min-h-screen bg-[#020617] flex items-center justify-center">
+        <div className="w-2 h-2 bg-cyan-400 rounded-full animate-pulse" style={{ boxShadow: '0 0 12px #22d3ee' }} />
+      </div>
+    );
+  }
+
+  if (!accessToken) {
+    return <LoginPage onLogin={handleLogin} />;
+  }
 
   return (
     <div className="min-h-screen bg-[#020617] bg-gradient-to-br from-[#0f172a] to-[#020617] flex overflow-hidden font-sans text-white">
@@ -296,6 +380,13 @@ function App() {
             </button>
             <button className="p-1.5 bg-white/5 hover:bg-white/10 rounded-lg border border-white/10 transition-colors">
               <Settings color="#22d3ee" size={14} />
+            </button>
+            <button
+              onClick={logout}
+              className="p-1.5 bg-white/5 hover:bg-red-500/20 rounded-lg border border-white/10 hover:border-red-500/30 transition-colors"
+              title="Cerrar sesión"
+            >
+              <LogOut size={14} color="#64748b" />
             </button>
           </div>
         </div>
