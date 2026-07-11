@@ -12,6 +12,9 @@ lunia-web/node_modules/
 lunia-web/.env.production
 lunia_2fa_qr.png
 
+# Datos personales (números de contactos)
+contactos.json
+
 # Archivos de Python
 __pycache__/
 *.py[cod]

@@ -3,6 +3,8 @@ import { motion, AnimatePresence } from 'framer-motion';
 import axios from 'axios';
 import { Mic, MicOff, Settings, Send, LogOut } from 'lucide-react';
 import LoginPage from './LoginPage';
+import SettingsPanel from './SettingsPanel';
+import ModePicker from './ModePicker';
 import { apiUrl } from './api';
 
 const API_URL = apiUrl('/ask');
@@ -17,6 +19,7 @@ function App() {
   const [chatInput, setChatInput] = useState("");
   const [messages, setMessages] = useState([]);
   const [voiceIndex, setVoiceIndex] = useState(0);
+  const [showSettings, setShowSettings] = useState(false);
 
   const recognitionRef = useRef(null);
   const wakeWordRecognitionRef = useRef(null);
@@ -218,12 +221,18 @@ function App() {
         const voices = window.speechSynthesis.getVoices().filter(v => v.lang.startsWith('es'));
 
         if (voices.length > 0) {
-          // Voces preferidas por plataforma (macOS, Windows, Linux/Android)
+          // Prioridad: voz elegida en Ajustes > voces preferidas por plataforma > índice de ciclo
           const preferidas = ['Marisol', 'Paulina', 'Monica', 'Pilar', 'Lucia', 'Jorge', 'Juan', 'Diego'];
+          const voceElegida = localStorage.getItem('lunia_voice_name');
           let selectedVoice = voices[voiceIndex % voices.length];
-          for (const nombre of preferidas) {
-            const encontrada = voices.find(v => v.name.includes(nombre));
-            if (encontrada) { selectedVoice = encontrada; break; }
+
+          if (voceElegida && voices.some(v => v.name === voceElegida)) {
+            selectedVoice = voices.find(v => v.name === voceElegida);
+          } else {
+            for (const nombre of preferidas) {
+              const encontrada = voices.find(v => v.name.includes(nombre));
+              if (encontrada) { selectedVoice = encontrada; break; }
+            }
           }
 
           utterance.voice = selectedVoice;
@@ -273,7 +282,6 @@ function App() {
     try {
       const response = await axios.post(API_URL, { text });
       const luniaSays = response.data.lunia_says;
-      setLastResponse(luniaSays);
       setStatus("Lunia responde");
       setMessages(prev => [...prev, { from: 'lunia', text: luniaSays }]);
       speak(luniaSays);
@@ -378,7 +386,12 @@ function App() {
             >
               <Mic size={14} color={isActiveListening ? "#22d3ee" : "#64748b"} className={isActiveListening ? "animate-pulse" : ""} />
             </button>
-            <button className="p-1.5 bg-white/5 hover:bg-white/10 rounded-lg border border-white/10 transition-colors">
+            <ModePicker />
+            <button
+              onClick={() => setShowSettings(true)}
+              className="p-1.5 bg-white/5 hover:bg-white/10 rounded-lg border border-white/10 transition-colors"
+              title="Ajustes"
+            >
               <Settings color="#22d3ee" size={14} />
             </button>
             <button
@@ -477,6 +490,10 @@ function App() {
           />
         ))}
       </div>
+
+      <AnimatePresence>
+        {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
+      </AnimatePresence>
 
     </div>
   );
